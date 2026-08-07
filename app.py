@@ -5,7 +5,7 @@ from google import genai
 app = Flask(__name__)
 client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
-AGENT = "antigravity-preview-05-2026"
+AGENT = "gemini-3.6-flash"
 
 @app.route("/generate", methods=["POST"])
 def generate():
