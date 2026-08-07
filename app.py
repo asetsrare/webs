@@ -7,7 +7,6 @@ app = Flask(__name__)
 # Server's own key (optional fallback)
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
-AGENT = "antigravity-preview-05-2026"
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 @app.route("/", methods=["GET"])
@@ -22,6 +21,7 @@ def generate():
 
     # Get the API key from the client (plugin)
     client_api_key = data.get("api_key")
+    client_ai_model = data.get("ai_model")
     
     # Use client's key if provided, otherwise fallback to server's key
     api_key_to_use = client_api_key or SERVER_API_KEY
@@ -30,7 +30,7 @@ def generate():
         return jsonify({"error": "No API key provided. Please enter your API key in the plugin."}), 400
 
     payload = {
-        "agent": AGENT,
+        "agent": client_ai_model,
         "input": data["prompt"],
         "environment": "remote",
     }
