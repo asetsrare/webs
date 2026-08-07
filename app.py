@@ -4,12 +4,9 @@ from google import genai
 
 app = Flask(__name__)
 
-# The client will look for the API key in the environment variable GOOGLE_API_KEY
-# or uses Application Default Credentials if running on GCP.
-# On Render, set the env var GOOGLE_API_KEY to your Gemini API key.
-client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY") or "your_key_here")
+# Client reads API key from GOOGLE_API_KEY env var
+client = genai.Client()
 
-# The agent name you want to use
 AGENT = "antigravity-preview-05-2026"
 
 @app.route("/", methods=["GET"])
@@ -26,12 +23,14 @@ def generate():
         interaction = client.interactions.create(
             agent=AGENT,
             input=data["prompt"],
-            environment="remote",   # or "local" if you want to run it locally
+            environment="remote",
         )
-        # The output is available in interaction.output_text
-        return jsonify({"response": interaction.output_text})
+        return jsonify({
+            "interaction_id": interaction.id,
+            "environment_id": interaction.environment_id,
+            "response": interaction.output_text
+        })
     except Exception as e:
-        # Log the error (you can also print to console)
         app.logger.error(f"GenAI error: {e}")
         return jsonify({"error": str(e)}), 500
 
