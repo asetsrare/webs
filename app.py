@@ -1,11 +1,16 @@
 import os
-import json
-import requests
 from flask import Flask, request, jsonify
+from google import genai
 
 app = Flask(__name__)
-API_KEY = os.environ.get("GEMINI_API_KEY")
-URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
+
+# The client will look for the API key in the environment variable GOOGLE_API_KEY
+# or uses Application Default Credentials if running on GCP.
+# On Render, set the env var GOOGLE_API_KEY to your Gemini API key.
+client = genai.Client()
+
+# The agent name you want to use
+AGENT = "antigravity-preview-05-2026"
 
 @app.route("/", methods=["GET"])
 def health():
@@ -13,45 +18,21 @@ def health():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    # Try to parse JSON with silent=True (won't raise exception)
-    data = request.get_json(silent=True)
-    
-    # If that failed, try manually parsing from raw data
-    if data is None:
-        try:
-            raw_data = request.data.decode('utf-8')
-            data = json.loads(raw_data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            return jsonify({
-                "error": "Invalid JSON payload",
-                "details": str(e),
-                "received": request.data.decode('utf-8', errors='ignore')[:200]
-            }), 400
-    
-    # Check if we have the 'prompt' field
+    data = request.get_json()
     if not data or "prompt" not in data:
-        return jsonify({
-            "error": "Missing 'prompt' field",
-            "received_keys": list(data.keys()) if data else []
-        }), 400
-    
-    # Call Gemini API
+        return jsonify({"error": "Missing 'prompt'"}), 400
+
     try:
-        payload = {"contents": [{"parts": [{"text": data["prompt"]}]}]}
-        response = requests.post(URL, json=payload)
-        
-        if response.status_code != 200:
-            return jsonify({
-                "error": "Gemini API error",
-                "status": response.status_code,
-                "details": response.text
-            }), response.status_code
-        
-        result = response.json()
-        text = result["candidates"][0]["content"]["parts"][0]["text"]
-        return jsonify({"response": text})
-        
+        interaction = client.interactions.create(
+            agent=AGENT,
+            input=data["prompt"],
+            environment="remote",   # or "local" if you want to run it locally
+        )
+        # The output is available in interaction.output_text
+        return jsonify({"response": interaction.output_text})
     except Exception as e:
+        # Log the error (you can also print to console)
+        app.logger.error(f"GenAI error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
