@@ -22,7 +22,6 @@ def generate():
     if not data or "prompt" not in data:
         return jsonify({"error": "Missing 'prompt'"}), 400
 
-    # Build the payload for a new interaction (no previous_interaction_id)
     payload = {
         "agent": AGENT,
         "input": data["prompt"],
@@ -38,14 +37,26 @@ def generate():
         resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers)
         resp.raise_for_status()
         result = resp.json()
-        # The response structure: we expect "output_text" or similar
-        output = result.get("output_text") or result.get("output") or result
-        return jsonify({"response": output})
+
+        # Extract the final output from the steps
+        output_text = None
+        for step in result.get("steps", []):
+            if step.get("type") == "model_output":
+                content = step.get("content", [])
+                # Concatenate all text pieces
+                texts = [item.get("text", "") for item in content if item.get("type") == "text"]
+                output_text = " ".join(texts)
+                break
+        
+        # Fallback if no model_output step found
+        if output_text is None:
+            output_text = result.get("output_text") or result.get("output") or str(result)
+
+        return jsonify({"response": output_text})
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Interactions API error: {e}")
-        # Return the error details from Google if possible
         error_detail = e.response.text if e.response else str(e)
         return jsonify({"error": error_detail}), 500
-
+        
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
