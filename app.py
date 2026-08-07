@@ -4,11 +4,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("No API key set. Set GOOGLE_API_KEY or GEMINI_API_KEY.")
+# Server's own key (optional fallback)
+SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
-# The managed agent name from your curl example
 AGENT = "antigravity-preview-05-2026"
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
@@ -22,6 +20,15 @@ def generate():
     if not data or "prompt" not in data:
         return jsonify({"error": "Missing 'prompt'"}), 400
 
+    # Get the API key from the client (plugin)
+    client_api_key = data.get("api_key")
+    
+    # Use client's key if provided, otherwise fallback to server's key
+    api_key_to_use = client_api_key or SERVER_API_KEY
+    
+    if not api_key_to_use:
+        return jsonify({"error": "No API key provided. Please enter your API key in the plugin."}), 400
+
     payload = {
         "agent": AGENT,
         "input": data["prompt"],
@@ -30,7 +37,7 @@ def generate():
 
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": API_KEY,
+        "x-goog-api-key": api_key_to_use,
     }
 
     try:
@@ -38,17 +45,15 @@ def generate():
         resp.raise_for_status()
         result = resp.json()
 
-        # Extract the final output from the steps
+        # Extract the final output
         output_text = None
         for step in result.get("steps", []):
             if step.get("type") == "model_output":
                 content = step.get("content", [])
-                # Concatenate all text pieces
                 texts = [item.get("text", "") for item in content if item.get("type") == "text"]
                 output_text = " ".join(texts)
                 break
         
-        # Fallback if no model_output step found
         if output_text is None:
             output_text = result.get("output_text") or result.get("output") or str(result)
 
@@ -57,6 +62,6 @@ def generate():
         app.logger.error(f"Interactions API error: {e}")
         error_detail = e.response.text if e.response else str(e)
         return jsonify({"error": error_detail}), 500
-        
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
