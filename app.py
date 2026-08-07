@@ -7,7 +7,7 @@ app = Flask(__name__)
 # The client will look for the API key in the environment variable GOOGLE_API_KEY
 # or uses Application Default Credentials if running on GCP.
 # On Render, set the env var GOOGLE_API_KEY to your Gemini API key.
-client = genai.Client()
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY") or "your_key_here")
 
 # The agent name you want to use
 AGENT = "antigravity-preview-05-2026"
