@@ -30,7 +30,7 @@ def generate():
 
         # 2. Get API key and agent name
         client_api_key = data.get("api_key")
-        client_ai_model = data.get("ai_model", "antigravity-preview-05-2026")  # Default if not provided
+        client_ai_model = data.get("ai_model")  
 
         # Use client's key if provided, otherwise fallback to server's key
         api_key_to_use = client_api_key or SERVER_API_KEY
@@ -39,7 +39,7 @@ def generate():
 
         # 3. Build payload for Google
         payload = {
-            "agent": client_ai_model,
+            "model": client_ai_model,
             "input": data["prompt"],
             "environment": "remote",
         }
