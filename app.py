@@ -51,7 +51,7 @@ def generate():
 
         # 4. Send request to Google with timeout
         app.logger.info(f"Sending request to Google with agent: {client_ai_model}")
-        resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers, timeout=30)
+        resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers, timeout=100)
         app.logger.info(f"Google responded with status: {resp.status_code}")
 
         # 5. Check for HTTP errors from Google
