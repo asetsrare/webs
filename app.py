@@ -447,7 +447,7 @@ def generate():
                 )
 
                 review_response = review_client.chat.completions.create(
-                    model="deepseek/deepseek-r1:free",
+                    model="openrouter/free",
                     messages=[{"role": "user", "content": FormattedReviewPrompt}],
                     extra_body={"include_reasoning": True},
                 )
