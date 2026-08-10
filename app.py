@@ -105,7 +105,7 @@ def call_gemini(model, prompt, api_key, max_retries=2, timeout=(10, 600)):
     payload = {
         "system_instruction": {
             "parts": [{
-                "text": "CRITICAL: You must output ONLY raw [SCRIPT_START]...[SCRIPT_END] blocks. No explanations, no markdown, no prose before or after. If no server script is needed, output exactly: 'No Server Script. [Script: <ScriptName>]'"
+                "text": "You are a code generator. You MUST output ONLY raw [SCRIPT_START]...[SCRIPT_END] blocks. NO explanations, NO markdown, NO reasoning, NO extra text. If no server script is needed, output exactly: 'No Server Script. [Script: <ScriptName>]'."
             }]
         },
         "contents": [{"parts": [{"text": prompt}]}],
