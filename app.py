@@ -447,7 +447,7 @@ def generate():
                 )
 
                 review_response = review_client.chat.completions.create(
-                    model="openrouter/free",
+                    model="nvidia/nemotron-3-ultra:free",
                     messages=[{"role": "user", "content": FormattedReviewPrompt}],
                     extra_body={"include_reasoning": True},
                 )
