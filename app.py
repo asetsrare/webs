@@ -372,8 +372,6 @@ def generate():
         data = request.get_json()
         if not data:
             return jsonify({"error": "Missing JSON body"}), 400
-        if "prompt" not in data:
-            return jsonify({"error": "Missing 'prompt' field"}), 400
 
         clientscript = data.get("client_scripts")
         additional = data.get("additional_info")
