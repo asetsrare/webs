@@ -4,7 +4,6 @@ import requests
 import json
 import logging
 from flask import Flask, request, jsonify
-from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -252,12 +251,12 @@ Pre-existing / reference server scripts (match their conventions, do not duplica
 
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+REVIEW_MODEL = "gemini-3.5-flash"  # fixed model for review
 
 logging.basicConfig(level=logging.INFO)
 
 SCRIPT_BLOCK_RE = re.compile(r"\[SCRIPT_START\](.*?)\[SCRIPT_END\]", re.DOTALL)
 SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -388,7 +387,6 @@ def generate():
 
         client_api_key = data.get("api_key")
         client_ai_model = data.get("ai_model")
-        openrouter_api = data.get("review_key")
 
         api_key_to_use = client_api_key or SERVER_API_KEY
         if not api_key_to_use:
@@ -396,6 +394,7 @@ def generate():
         if not client_ai_model:
             return jsonify({"error": "Missing 'ai_model' field"}), 400
 
+        # --- Generation step ---
         payload = {
             "model": client_ai_model,
             "input": FormattedPrompt,
@@ -406,7 +405,7 @@ def generate():
             "x-goog-api-key": api_key_to_use,
         }
 
-        app.logger.info(f"Sending request to Google with agent: {client_ai_model}")
+        app.logger.info(f"Sending generation request to Google with agent: {client_ai_model}")
         resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers, timeout=100)
         app.logger.info(f"Google responded with status: {resp.status_code}")
 
@@ -427,44 +426,45 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review stage (only runs if a review key was supplied) ---
+        # --- Review stage (now always runs, using Gemini 2.5 Flash via the same Google API) ---
         review_result = None
         review_reasoning = None
         final_output = output_text
         changed_scripts = []
 
-        if openrouter_api:
-            try:
-                review_client = OpenAI(
-                    base_url="https://openrouter.ai/api/v1",
-                    api_key=openrouter_api,
-                )
+        try:
+            # Build review prompt
+            FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
+                client_scripts=clientscript,
+                server_output=output_text,
+                pre_existing_scripts=serverside or "None provided.",
+            )
 
-                FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
-                    client_scripts=clientscript,
-                    server_output=output_text,
-                    pre_existing_scripts=serverside or "None provided.",
-                )
+            review_payload = {
+                "model": REVIEW_MODEL,
+                "input": FormattedReviewPrompt,
+                "environment": "remote",
+            }
+            # Use the same headers (same API key)
+            review_resp = requests.post(INTERACTIONS_URL, json=review_payload, headers=headers, timeout=100)
+            app.logger.info(f"Review request status: {review_resp.status_code}")
 
-                review_response = review_client.chat.completions.create(
-                    model="google/gemini-2.5-flash:free",
-                    messages=[{"role": "user", "content": FormattedReviewPrompt}]
-                )
+            if review_resp.status_code == 200:
+                review_result_json = review_resp.json()
+                review_message = extract_gemini_output(review_result_json)
+                review_result = clean_model_output(review_message)
 
-                review_message = review_response.choices[0].message
-                review_result = review_message.content
-                review_reasoning = getattr(review_message, "reasoning", None)
-
+                # Merge reviewed blocks into the original generation
                 final_output, changed_scripts = merge_reviewed_output(output_text, review_result)
-
-            except Exception as e:
-                # A failed review should not lose an already-successful generation.
-                app.logger.error(f"Review stage failed, returning unreviewed output: {e}")
-                review_result = None
-                review_reasoning = None
+            else:
+                # If review fails, log and keep the generation output
+                app.logger.error(f"Review API call failed with status {review_resp.status_code}: {review_resp.text[:200]}")
                 final_output = output_text
-        else:
-            app.logger.info("No review_key provided; skipping DeepSeek review stage")
+
+        except Exception as e:
+            # A failed review should not lose an already-successful generation.
+            app.logger.error(f"Review stage failed, returning unreviewed output: {e}")
+            final_output = output_text
 
         return jsonify({
             "response": final_output,
