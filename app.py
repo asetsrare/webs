@@ -111,7 +111,7 @@ def call_gemini(model, prompt, api_key, max_retries=2, timeout=(10, 600)):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 8192,   # <-- was 2048, now 8192
+            "maxOutputTokens": 16384,   # <-- was 2048, now 8192
             "topP": 1.0,
         }
     }
