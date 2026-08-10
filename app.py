@@ -19,7 +19,7 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # =========================================================================
 
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-REVIEW_MODEL = "gemini-2.5-flash"   # or "gemini-3.5-flash" when available
+REVIEW_MODEL = "gemini-3.6-flash"   # or "gemini-3.5-flash" when available
 
 logging.basicConfig(level=logging.INFO)
 
