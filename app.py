@@ -447,9 +447,8 @@ def generate():
                 )
 
                 review_response = review_client.chat.completions.create(
-                    model="nvidia/nemotron-3-ultra:free",
-                    messages=[{"role": "user", "content": FormattedReviewPrompt}],
-                    extra_body={"include_reasoning": True},
+                    model="qwen/qwen-2.5-coder-32b-instruct:free",
+                    messages=[{"role": "user", "content": FormattedReviewPrompt}]
                 )
 
                 review_message = review_response.choices[0].message
