@@ -447,7 +447,7 @@ def generate():
                 )
 
                 review_response = review_client.chat.completions.create(
-                    model="qwen/qwen-2.5-coder-32b-instruct:free",
+                    model="google/gemini-2.5-flash:free",
                     messages=[{"role": "user", "content": FormattedReviewPrompt}]
                 )
 
