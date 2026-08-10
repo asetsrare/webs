@@ -19,7 +19,7 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # =========================================================================
 
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-REVIEW_MODEL = "gemini-3.6-flash"   # or "gemini-3.5-flash" when available
+REVIEW_MODEL = "gemini-2.5-flash"   # fastest and reliable
 
 logging.basicConfig(level=logging.INFO)
 
@@ -100,18 +100,20 @@ def extract_gemini_output(result):
 
     return str(result)
 
-def call_gemini(model, prompt, api_key, max_retries=2, timeout=(10, 600)):
+def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
+    # Add the system instruction at the very top of the prompt (Gemini doesn't need separate field)
+    full_prompt = (
+        "You are a code generator. You MUST output ONLY raw [SCRIPT_START]...[SCRIPT_END] blocks. "
+        "NO explanations, NO markdown, NO reasoning, NO extra text. "
+        "If no server script is needed, output exactly: 'No Server Script. [Script: <ScriptName>]'.\n\n"
+        + prompt
+    )
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
-        "system_instruction": {
-            "parts": [{
-                "text": "You are a code generator. You MUST output ONLY raw [SCRIPT_START]...[SCRIPT_END] blocks. NO explanations, NO markdown, NO reasoning, NO extra text. If no server script is needed, output exactly: 'No Server Script. [Script: <ScriptName>]'."
-            }]
-        },
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 16384,   # <-- was 2048, now 8192
+            "maxOutputTokens": 16384,
             "topP": 1.0,
         }
     }
@@ -126,8 +128,10 @@ def call_gemini(model, prompt, api_key, max_retries=2, timeout=(10, 600)):
                 app.logger.error(f"Gemini API error (status {resp.status_code}): {resp.text[:200]}")
                 return resp
         except requests.Timeout:
-            app.logger.warning(f"Request timed out on attempt {attempt+1}/{max_retries}, retrying...")
-            time.sleep(2 ** attempt)
+            app.logger.warning(f"Timeout on attempt {attempt+1}/{max_retries}, extending timeout...")
+            # Increase timeout for next retry
+            timeout = (timeout[0], timeout[1] + 120)  # add 2 minutes each retry
+            time.sleep(2 ** attempt)  # exponential backoff
         except Exception as e:
             app.logger.error(f"Request exception: {e}")
             break
@@ -173,7 +177,7 @@ def generate():
         # --- Generation ---
         app.logger.info(f"Sending generation request to Gemini with model: {client_ai_model}")
         try:
-            gen_resp = call_gemini(client_ai_model, FormattedPrompt, api_key_to_use, max_retries=2, timeout=(10, 300))
+            gen_resp = call_gemini(client_ai_model, FormattedPrompt, api_key_to_use, max_retries=3, timeout=(10, 1200))
         except Exception as e:
             app.logger.error(f"Generation failed after retries: {e}")
             return jsonify({"error": "Generation failed", "details": str(e)}), 500
@@ -195,11 +199,12 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review ---
+        # --- Review (now using gemini-2.5-flash for speed) ---
         review_result = None
         final_output = output_text
         changed_scripts = []
 
+        # Comment out the review stage if you want to skip it completely
         try:
             FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
                 client_scripts=clientscript,
@@ -208,7 +213,7 @@ def generate():
             )
 
             app.logger.info("Sending review request to Gemini...")
-            review_resp = call_gemini(REVIEW_MODEL, FormattedReviewPrompt, api_key_to_use, max_retries=3, timeout=(10, 600))
+            review_resp = call_gemini(REVIEW_MODEL, FormattedReviewPrompt, api_key_to_use, max_retries=3, timeout=(10, 1200))
 
             if review_resp.status_code == 200:
                 review_json = review_resp.json()
