@@ -406,7 +406,7 @@ def generate():
         }
 
         app.logger.info(f"Sending generation request to Google with agent: {client_ai_model}")
-        resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers, timeout=100)
+        resp = requests.post(INTERACTIONS_URL, json=payload, headers=headers, timeout=(10, 300))
         app.logger.info(f"Google responded with status: {resp.status_code}")
 
         if resp.status_code != 200:
@@ -446,7 +446,7 @@ def generate():
                 "environment": "remote",
             }
             # Use the same headers (same API key)
-            review_resp = requests.post(INTERACTIONS_URL, json=review_payload, headers=headers, timeout=100)
+            review_resp = requests.post(INTERACTIONS_URL, json=review_payload, headers=headers, timeout=(10, 300))
             app.logger.info(f"Review request status: {review_resp.status_code}")
 
             if review_resp.status_code == 200:
