@@ -172,7 +172,9 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=1
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
-                reasoning_format="hidden"
+                extra_body={
+                    "reasoning_format": "hidden"
+                }
             )
             return response.choices[0].message.content
         except Exception as e:
