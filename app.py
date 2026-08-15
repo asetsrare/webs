@@ -21,7 +21,7 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "qwen/qwen3.6-27b"   # or "llama-3.3-70b-versatile"
-MAX_TOKENS_PER_REQUEST = 6000     # stay well below the 8000 TPM limit
+MAX_TOKENS_PER_REQUEST = 4000     # stay well below the 8000 TPM limit (leaves room for overhead)
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are a senior Roblox Luau code reviewer. Output ONLY raw "
@@ -39,7 +39,7 @@ SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
 # HELPERS
 # =========================================================================
 
-def truncate_text(text, max_chars=15000):
+def truncate_text(text, max_chars=10000):
     """Truncate text to roughly stay within token limits (1 token ~ 4 chars)."""
     if not text:
         return text
@@ -158,20 +158,20 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=1
 def split_into_chunks(server_output, client_scripts, pre_existing, max_tokens=MAX_TOKENS_PER_REQUEST):
     """
     Split server_output into chunks so that each request stays under max_tokens.
-    We account for the fixed overhead (client_scripts + pre_existing + prompt template).
+    Accounts for overhead (client_scripts, pre_existing, prompt template).
     Returns a list of chunks (strings).
     """
-    # Estimate overhead characters from the prompt template (roughly)
-    # The template includes the fixed text; we'll approximate 500 chars for the template.
+    # Estimate overhead characters from the prompt template and fixed parts
+    # The template itself adds ~500 chars, plus the client_scripts and pre_existing.
     TEMPLATE_OVERHEAD = 500
     overhead_chars = len(client_scripts) + len(pre_existing) + TEMPLATE_OVERHEAD
 
     # Maximum characters allowed for server_output per chunk
-    # 1 token ≈ 4 chars, but to be safe we use 4.5? We'll use 4.
-    max_chars_per_chunk = (max_tokens * 4) - overhead_chars
+    # Use 3.5 chars per token to be conservative (especially for code with symbols)
+    max_chars_per_chunk = int((max_tokens * 3.5) - overhead_chars)
 
     if max_chars_per_chunk <= 0:
-        # Even the overhead alone exceeds the limit – we need to truncate client_scripts further.
+        # Even the overhead alone exceeds the limit – we need to truncate further.
         raise ValueError("Overhead too large for token limit. Please reduce client_scripts or pre_existing size.")
 
     # If the entire output fits, return it as one chunk
@@ -179,10 +179,10 @@ def split_into_chunks(server_output, client_scripts, pre_existing, max_tokens=MA
         return [server_output]
 
     chunks = []
+    # Try to split on newline boundaries first
+    lines = server_output.splitlines(keepends=True)
     current_chunk = ""
-    # We'll try to split on newline boundaries
-    for line in server_output.splitlines(keepends=True):
-        # If adding this line would exceed the limit, finalize the current chunk
+    for line in lines:
         if len(current_chunk) + len(line) > max_chars_per_chunk and current_chunk:
             chunks.append(current_chunk)
             current_chunk = line
@@ -191,7 +191,7 @@ def split_into_chunks(server_output, client_scripts, pre_existing, max_tokens=MA
     if current_chunk:
         chunks.append(current_chunk)
 
-    # If any single chunk is still too large (e.g., a single huge line), we force-split by character
+    # If any chunk is still too large (e.g., a single massive line), force-split by character
     final_chunks = []
     for chunk in chunks:
         if len(chunk) > max_chars_per_chunk:
@@ -270,10 +270,9 @@ def generate():
         review_raw = None
 
         if groq_api_key:
-            # Truncate client_scripts to reduce overhead
-            truncated_clientscript = truncate_text(clientscript, max_chars=15000)
-            # Also truncate serverside if it's huge (optional)
-            truncated_serverside = truncate_text(serverside or "", max_chars=10000)
+            # Aggressively truncate client_scripts and serverside to reduce overhead
+            truncated_clientscript = truncate_text(clientscript, max_chars=10000)
+            truncated_serverside = truncate_text(serverside or "", max_chars=5000)
 
             try:
                 chunks = split_into_chunks(
@@ -284,7 +283,6 @@ def generate():
                 )
             except ValueError as e:
                 app.logger.error(f"Chunking failed: {e}")
-                # Skip review entirely
                 return jsonify({
                     "response": output_text,
                     "generation_raw": output_text,
