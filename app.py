@@ -20,12 +20,21 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # =========================================================================
 
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-SERVER_DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")  # optional fallback if client doesn't send one
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-REVIEW_MODEL = "deepseek-v4-pro"  # NOTE: DeepSeek gives new accounts a 5M-token / 30-day free grant,
-                                  # not a permanently-free tier -- once that's spent or expired, calls
-                                  # start failing on auth/billing and the code below falls back to
-                                  # returning the unreviewed generation instead of erroring out.
+
+# Groq: free indefinitely (no expiry), no credit card, but rate-limited
+# (roughly 30 req/min, daily caps and TPM vary by model). Verify the
+# model slug and its current limits at console.groq.com before relying
+# on this in production -- the free model roster and limits do change.
+SERVER_GROQ_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "qwen/qwen3.6-27b"
+
+REVIEWER_SYSTEM_PROMPT = (
+    "You are a senior Roblox Luau code reviewer. Output ONLY raw "
+    "[SCRIPT_START]...[SCRIPT_END] blocks per the format given in the "
+    "user prompt, or 'No Changes Required. [Reviewed: ...]' if nothing "
+    "needed fixing. No markdown, no extra prose."
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -143,13 +152,13 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
             break
     raise Exception(f"All retries failed for model {model}")
 
-def call_deepseek_review(prompt, api_key, model=REVIEW_MODEL, max_retries=2, timeout=180.0):
-    """Calls DeepSeek's official API for the review stage. Uses the
-    OpenAI-compatible SDK against api.deepseek.com. Returns the response
-    text, or raises on failure (caller falls back to unreviewed output)."""
+def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=180.0):
+    """Calls Groq's OpenAI-compatible API for the review stage. Returns
+    the response text, or raises on failure (caller falls back to
+    unreviewed output)."""
     client = OpenAI(
         api_key=api_key,
-        base_url=DEEPSEEK_BASE_URL,
+        base_url=GROQ_BASE_URL,
         timeout=timeout,
     )
 
@@ -159,24 +168,14 @@ def call_deepseek_review(prompt, api_key, model=REVIEW_MODEL, max_retries=2, tim
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a senior Roblox Luau code reviewer. Output ONLY raw "
-                            "[SCRIPT_START]...[SCRIPT_END] blocks per the format given in the "
-                            "user prompt, or 'No Changes Required. [Reviewed: ...]' if nothing "
-                            "needed fixing. No markdown, no extra prose."
-                        ),
-                    },
+                    {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}},
             )
             return response.choices[0].message.content
         except Exception as e:
-            app.logger.warning(f"DeepSeek review attempt {attempt+1}/{max_retries} failed: {e}")
+            app.logger.warning(f"Groq review attempt {attempt+1}/{max_retries} failed: {e}")
             last_error = e
             time.sleep(2 ** attempt)
 
@@ -212,7 +211,7 @@ def generate():
 
         client_api_key = data.get("api_key")
         client_ai_model = data.get("ai_model")
-        deepseek_api_key = data.get("review_key") or SERVER_DEEPSEEK_KEY
+        groq_api_key = data.get("review_key") or SERVER_GROQ_KEY
 
         api_key_to_use = client_api_key or SERVER_API_KEY
         if not api_key_to_use:
@@ -245,13 +244,13 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review (DeepSeek V4 Pro, official API) ---
+        # --- Review (Groq only) ---
         review_result = None
         final_output = output_text
         changed_scripts = []
 
-        if not deepseek_api_key:
-            app.logger.info("No DeepSeek API key provided (review_key missing and no server fallback set); skipping review.")
+        if not groq_api_key:
+            app.logger.info("No Groq API key provided (review_key missing and no server fallback set); skipping review.")
         else:
             try:
                 FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
@@ -260,15 +259,15 @@ def generate():
                     pre_existing_scripts=serverside or "None provided.",
                 )
 
-                app.logger.info(f"Sending review request to DeepSeek ({REVIEW_MODEL})...")
-                review_raw = call_deepseek_review(FormattedReviewPrompt, deepseek_api_key)
+                app.logger.info(f"Sending review request to Groq ({GROQ_MODEL})...")
+                review_raw = call_groq_review(FormattedReviewPrompt, groq_api_key)
                 review_result = clean_model_output(review_raw)
                 final_output, changed_scripts = merge_reviewed_output(output_text, review_result)
 
             except Exception as e:
-                # Covers: expired/exhausted free grant, invalid key, rate limit, timeout, etc.
+                # Covers: rate limit, invalid key, timeout, etc.
                 # Never let a review failure lose the already-successful generation.
-                app.logger.error(f"DeepSeek review stage failed, returning unreviewed output: {e}")
+                app.logger.error(f"Groq review stage failed, returning unreviewed output: {e}")
                 review_result = None
                 final_output = output_text
 
@@ -276,7 +275,7 @@ def generate():
             "response": final_output,
             "generation_raw": output_text,
             "review_raw": review_result,
-            "review_model_used": REVIEW_MODEL if review_result else None,
+            "review_model_used": GROQ_MODEL if review_result else None,
             "scripts_changed_by_review": changed_scripts,
         })
 
