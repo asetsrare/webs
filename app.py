@@ -19,12 +19,9 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # CONFIG
 # =========================================================================
 
-SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-
-# Groq: free indefinitely (no expiry), no credit card, but rate-limited
-SERVER_GROQ_KEY = os.environ.get("GROQ_API_KEY")
+# No environment key fallbacks – everything comes from the request.
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL = "qwen/qwen3.6-27b"   # You can switch to llama-3.3-70b-versatile if needed
+GROQ_MODEL = "qwen/qwen3.6-27b"   # or "llama-3.3-70b-versatile"
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are a senior Roblox Luau code reviewer. Output ONLY raw "
@@ -49,39 +46,6 @@ def truncate_text(text, max_chars=20000):
     if len(text) > max_chars:
         return text[:max_chars] + "\n\n... [TRUNCATED due to Groq API token limits]"
     return text
-
-def chunk_text(text, max_tokens=6000):
-    """
-    Split text into chunks of roughly max_tokens.
-    Attempts to break at script boundaries ([SCRIPT_START]).
-    Returns a list of chunks.
-    """
-    if not text:
-        return []
-    # Rough token estimate: 1 token ~ 4 characters
-    if len(text) // 4 <= max_tokens:
-        return [text]
-
-    chunks = []
-    # Try to split by script blocks first
-    blocks = parse_script_blocks(text)
-    if blocks:
-        current_chunk = ""
-        for name, block in blocks.items():
-            # Estimate tokens of current chunk + block
-            if (len(current_chunk) + len(block)) // 4 > max_tokens and current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = block
-            else:
-                current_chunk += ("\n\n" if current_chunk else "") + block
-        if current_chunk:
-            chunks.append(current_chunk)
-    else:
-        # Fallback: naive character split
-        chunk_size = max_tokens * 4
-        for i in range(0, len(text), chunk_size):
-            chunks.append(text[i:i+chunk_size])
-    return chunks
 
 def clean_model_output(text):
     if not text:
@@ -113,29 +77,6 @@ def parse_script_blocks(text):
         name = name_match.group(1).strip()
         blocks[name] = "[SCRIPT_START]" + body + "[SCRIPT_END]"
     return blocks
-
-def merge_reviewed_output(base_text, review_text):
-    # This is kept for backward compatibility; we'll mostly use direct block merging.
-    review_text = clean_model_output(review_text)
-
-    if not review_text or review_text.startswith("No Changes Required"):
-        return base_text, []
-
-    base_blocks = parse_script_blocks(base_text)
-    review_blocks = parse_script_blocks(review_text)
-
-    if not review_blocks:
-        app.logger.warning(f"Review output not in [SCRIPT_START] format; keeping base output only, Output: {review_text}")
-        return base_text, []
-
-    if not base_blocks:
-        app.logger.warning("Base output not in [SCRIPT_START] format; skipping merge, returning both raw")
-        return base_text + "\n\n" + review_text, list(review_blocks.keys())
-
-    merged = dict(base_blocks)
-    changed_names = list(review_blocks.keys())
-    merged.update(review_blocks)
-    return "\n\n".join(merged.values()), changed_names
 
 def extract_gemini_output(result):
     # interactions style
@@ -238,9 +179,17 @@ def generate():
         clientscript = data.get("client_scripts")
         additional = data.get("additional_info")
         serverside = data.get("server_scripts")
+        gemini_api_key = data.get("api_key")          # Gemini key from request
+        gemini_model = data.get("ai_model")           # Gemini model from request
+        groq_api_key = data.get("review_key")         # Groq key from request (optional)
 
+        # --- Validate required fields ---
         if not clientscript:
             return jsonify({"error": "Missing 'client_scripts' field"}), 400
+        if not gemini_api_key:
+            return jsonify({"error": "Missing 'api_key' for Gemini"}), 400
+        if not gemini_model:
+            return jsonify({"error": "Missing 'ai_model' field"}), 400
 
         FormattedPrompt = Base_prompt.format(
             first=clientscript,
@@ -248,20 +197,10 @@ def generate():
             third=serverside or "None provided.",
         )
 
-        client_api_key = data.get("api_key")
-        client_ai_model = data.get("ai_model")
-        groq_api_key = data.get("review_key") or SERVER_GROQ_KEY
-
-        api_key_to_use = client_api_key or SERVER_API_KEY
-        if not api_key_to_use:
-            return jsonify({"error": "No API key provided. Please enter your API key in the plugin."}), 400
-        if not client_ai_model:
-            return jsonify({"error": "Missing 'ai_model' field"}), 400
-
-        # --- Generation ---
-        app.logger.info(f"Sending generation request to Gemini with model: {client_ai_model}")
+        # --- Generation using Gemini ---
+        app.logger.info(f"Sending generation request to Gemini with model: {gemini_model}")
         try:
-            gen_resp = call_gemini(client_ai_model, FormattedPrompt, api_key_to_use, max_retries=3, timeout=(10, 1200))
+            gen_resp = call_gemini(gemini_model, FormattedPrompt, gemini_api_key, max_retries=3, timeout=(10, 1200))
         except Exception as e:
             app.logger.error(f"Generation failed after retries: {e}")
             return jsonify({"error": "Generation failed", "details": str(e)}), 500
@@ -283,70 +222,76 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review (Groq only) - CHUNKED ---
+        # --- Review (Groq only) - SIMPLE TWO-HALF SPLIT ---
         final_output = output_text
         changed_scripts = []
         review_raw = None
 
-        if not groq_api_key:
-            app.logger.info("No Groq API key provided; skipping review.")
-        else:
-            # Truncate client_scripts if too large for a single review prompt
-            # We'll keep it under 20k characters (~5000 tokens) to leave room for other parts.
+        # If Groq key is provided, run the review; otherwise skip
+        if groq_api_key:
+            # Truncate client_scripts to avoid token limit (optional)
             truncated_clientscript = truncate_text(clientscript, max_chars=20000)
 
-            # Split the generated server_output into chunks
-            output_chunks = chunk_text(output_text, max_tokens=6000)
-            app.logger.info(f"Split server_output into {len(output_chunks)} chunks for review.")
+            # Split the server_output into two roughly equal halves
+            total_len = len(output_text)
+            half = total_len // 2
+            # Try to split on newline to avoid cutting in the middle of a line
+            split_pos = output_text.find('\n', half)
+            if split_pos == -1:
+                split_pos = half
+            first_half = output_text[:split_pos]
+            second_half = output_text[split_pos:]
+
+            app.logger.info(f"Split output into two halves: {len(first_half)} and {len(second_half)} chars")
 
             all_reviewed_blocks = {}
             all_changed = []
+            review_raw_parts = []
 
-            for idx, chunk in enumerate(output_chunks):
-                try:
-                    # Build prompt for this chunk
-                    FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
-                        client_scripts=truncated_clientscript,
-                        server_output=chunk,
-                        pre_existing_scripts=serverside or "None provided.",
-                    )
+            # Review first half
+            try:
+                prompt1 = BASEREVIEWER_PROMPT.format(
+                    client_scripts=truncated_clientscript,
+                    server_output=first_half,
+                    pre_existing_scripts=serverside or "None provided.",
+                )
+                review1 = call_groq_review(prompt1, groq_api_key)
+                review1_blocks = parse_script_blocks(review1)
+                all_reviewed_blocks.update(review1_blocks)
+                all_changed.extend(review1_blocks.keys())
+                review_raw_parts.append(f"--- FIRST HALF ---\n{review1}")
+            except Exception as e:
+                app.logger.error(f"First half review failed: {e}, keeping original")
+                orig_blocks1 = parse_script_blocks(first_half)
+                all_reviewed_blocks.update(orig_blocks1)
 
-                    app.logger.info(f"Reviewing chunk {idx+1}/{len(output_chunks)}...")
-                    review_text = call_groq_review(FormattedReviewPrompt, groq_api_key)
-                    review_blocks = parse_script_blocks(review_text)
+            # Small delay to avoid rate limiting
+            time.sleep(1.5)
 
-                    if review_blocks:
-                        all_reviewed_blocks.update(review_blocks)
-                        all_changed.extend(review_blocks.keys())
-                    else:
-                        # If no blocks returned, keep the original chunk's blocks
-                        original_blocks = parse_script_blocks(chunk)
-                        all_reviewed_blocks.update(original_blocks)
-                        app.logger.warning(f"Chunk {idx+1} returned no review blocks, using original.")
+            # Review second half
+            try:
+                prompt2 = BASEREVIEWER_PROMPT.format(
+                    client_scripts=truncated_clientscript,
+                    server_output=second_half,
+                    pre_existing_scripts=serverside or "None provided.",
+                )
+                review2 = call_groq_review(prompt2, groq_api_key)
+                review2_blocks = parse_script_blocks(review2)
+                all_reviewed_blocks.update(review2_blocks)
+                all_changed.extend(review2_blocks.keys())
+                review_raw_parts.append(f"--- SECOND HALF ---\n{review2}")
+            except Exception as e:
+                app.logger.error(f"Second half review failed: {e}, keeping original")
+                orig_blocks2 = parse_script_blocks(second_half)
+                all_reviewed_blocks.update(orig_blocks2)
 
-                    # Store raw review for debugging (optional)
-                    if idx == 0:
-                        review_raw = review_text
-                    else:
-                        review_raw = (review_raw or "") + "\n\n--- CHUNK " + str(idx+1) + " ---\n" + review_text
-
-                except Exception as e:
-                    app.logger.error(f"Review failed for chunk {idx+1}: {e}, using original chunk.")
-                    original_blocks = parse_script_blocks(chunk)
-                    all_reviewed_blocks.update(original_blocks)
-
-                # Small delay to avoid rate limiting
-                if idx < len(output_chunks) - 1:
-                    time.sleep(1.5)
-
-            # Merge reviewed blocks over original blocks
+            # Merge reviewed blocks with original blocks
             original_blocks = parse_script_blocks(output_text)
             merged_blocks = dict(original_blocks)
             merged_blocks.update(all_reviewed_blocks)  # reviewed overrides original
-
-            # Reconstruct final output
             final_output = "\n\n".join(merged_blocks.values())
-            changed_scripts = list(all_changed)  # list of script names that were changed
+            changed_scripts = list(all_changed)
+            review_raw = "\n\n".join(review_raw_parts)
 
         return jsonify({
             "response": final_output,
