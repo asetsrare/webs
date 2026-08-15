@@ -4,6 +4,7 @@ import requests
 import json
 import logging
 from flask import Flask, request, jsonify
+from openai import OpenAI
 import time
 
 app = Flask(__name__)
@@ -19,7 +20,12 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # =========================================================================
 
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-REVIEW_MODEL = "gemini-3.6-flash"   # fastest and reliable
+SERVER_DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")  # optional fallback if client doesn't send one
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+REVIEW_MODEL = "deepseek-v4-pro"  # NOTE: DeepSeek gives new accounts a 5M-token / 30-day free grant,
+                                  # not a permanently-free tier -- once that's spent or expired, calls
+                                  # start failing on auth/billing and the code below falls back to
+                                  # returning the unreviewed generation instead of erroring out.
 
 logging.basicConfig(level=logging.INFO)
 
@@ -137,6 +143,45 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
             break
     raise Exception(f"All retries failed for model {model}")
 
+def call_deepseek_review(prompt, api_key, model=REVIEW_MODEL, max_retries=2, timeout=180.0):
+    """Calls DeepSeek's official API for the review stage. Uses the
+    OpenAI-compatible SDK against api.deepseek.com. Returns the response
+    text, or raises on failure (caller falls back to unreviewed output)."""
+    client = OpenAI(
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+        timeout=timeout,
+    )
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a senior Roblox Luau code reviewer. Output ONLY raw "
+                            "[SCRIPT_START]...[SCRIPT_END] blocks per the format given in the "
+                            "user prompt, or 'No Changes Required. [Reviewed: ...]' if nothing "
+                            "needed fixing. No markdown, no extra prose."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}},
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            app.logger.warning(f"DeepSeek review attempt {attempt+1}/{max_retries} failed: {e}")
+            last_error = e
+            time.sleep(2 ** attempt)
+
+    raise last_error
+
 # =========================================================================
 # ROUTES
 # =========================================================================
@@ -167,6 +212,7 @@ def generate():
 
         client_api_key = data.get("api_key")
         client_ai_model = data.get("ai_model")
+        deepseek_api_key = data.get("review_key") or SERVER_DEEPSEEK_KEY
 
         api_key_to_use = client_api_key or SERVER_API_KEY
         if not api_key_to_use:
@@ -199,40 +245,38 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review (now using gemini-2.5-flash for speed) ---
+        # --- Review (DeepSeek V4 Pro, official API) ---
         review_result = None
         final_output = output_text
         changed_scripts = []
 
-        # Comment out the review stage if you want to skip it completely
-        try:
-            FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
-                client_scripts=clientscript,
-                server_output=output_text,
-                pre_existing_scripts=serverside or "None provided.",
-            )
+        if not deepseek_api_key:
+            app.logger.info("No DeepSeek API key provided (review_key missing and no server fallback set); skipping review.")
+        else:
+            try:
+                FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
+                    client_scripts=clientscript,
+                    server_output=output_text,
+                    pre_existing_scripts=serverside or "None provided.",
+                )
 
-            app.logger.info("Sending review request to Gemini...")
-            review_resp = call_gemini(REVIEW_MODEL, FormattedReviewPrompt, api_key_to_use, max_retries=3, timeout=(10, 1200))
-
-            if review_resp.status_code == 200:
-                review_json = review_resp.json()
-                review_message = extract_gemini_output(review_json)
-                review_result = clean_model_output(review_message)
+                app.logger.info(f"Sending review request to DeepSeek ({REVIEW_MODEL})...")
+                review_raw = call_deepseek_review(FormattedReviewPrompt, deepseek_api_key)
+                review_result = clean_model_output(review_raw)
                 final_output, changed_scripts = merge_reviewed_output(output_text, review_result)
-            else:
-                app.logger.error(f"Review API call failed with status {review_resp.status_code}: {review_resp.text[:200]}")
-                final_output = output_text
 
-        except Exception as e:
-            app.logger.error(f"Review stage failed, returning unreviewed output: {e}")
-            final_output = output_text
+            except Exception as e:
+                # Covers: expired/exhausted free grant, invalid key, rate limit, timeout, etc.
+                # Never let a review failure lose the already-successful generation.
+                app.logger.error(f"DeepSeek review stage failed, returning unreviewed output: {e}")
+                review_result = None
+                final_output = output_text
 
         return jsonify({
             "response": final_output,
             "generation_raw": output_text,
             "review_raw": review_result,
-            "review_reasoning": None,
+            "review_model_used": REVIEW_MODEL if review_result else None,
             "scripts_changed_by_review": changed_scripts,
         })
 
