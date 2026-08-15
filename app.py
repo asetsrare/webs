@@ -3,9 +3,9 @@ import re
 import requests
 import json
 import logging
+import time
 from flask import Flask, request, jsonify
 from openai import OpenAI
-import time
 
 app = Flask(__name__)
 
@@ -22,12 +22,9 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 SERVER_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
 # Groq: free indefinitely (no expiry), no credit card, but rate-limited
-# (roughly 30 req/min, daily caps and TPM vary by model). Verify the
-# model slug and its current limits at console.groq.com before relying
-# on this in production -- the free model roster and limits do change.
 SERVER_GROQ_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL = "qwen/qwen3.6-27b"
+GROQ_MODEL = "qwen/qwen3.6-27b"   # You can switch to llama-3.3-70b-versatile if needed
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are a senior Roblox Luau code reviewer. Output ONLY raw "
@@ -44,6 +41,47 @@ SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
 # =========================================================================
 # HELPERS
 # =========================================================================
+
+def truncate_text(text, max_chars=20000):
+    """Truncate text to roughly stay within token limits (1 token ~ 4 chars)."""
+    if not text:
+        return text
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n\n... [TRUNCATED due to Groq API token limits]"
+    return text
+
+def chunk_text(text, max_tokens=6000):
+    """
+    Split text into chunks of roughly max_tokens.
+    Attempts to break at script boundaries ([SCRIPT_START]).
+    Returns a list of chunks.
+    """
+    if not text:
+        return []
+    # Rough token estimate: 1 token ~ 4 characters
+    if len(text) // 4 <= max_tokens:
+        return [text]
+
+    chunks = []
+    # Try to split by script blocks first
+    blocks = parse_script_blocks(text)
+    if blocks:
+        current_chunk = ""
+        for name, block in blocks.items():
+            # Estimate tokens of current chunk + block
+            if (len(current_chunk) + len(block)) // 4 > max_tokens and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = block
+            else:
+                current_chunk += ("\n\n" if current_chunk else "") + block
+        if current_chunk:
+            chunks.append(current_chunk)
+    else:
+        # Fallback: naive character split
+        chunk_size = max_tokens * 4
+        for i in range(0, len(text), chunk_size):
+            chunks.append(text[i:i+chunk_size])
+    return chunks
 
 def clean_model_output(text):
     if not text:
@@ -77,6 +115,7 @@ def parse_script_blocks(text):
     return blocks
 
 def merge_reviewed_output(base_text, review_text):
+    # This is kept for backward compatibility; we'll mostly use direct block merging.
     review_text = clean_model_output(review_text)
 
     if not review_text or review_text.startswith("No Changes Required"):
@@ -116,7 +155,6 @@ def extract_gemini_output(result):
     return str(result)
 
 def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
-    # Add the system instruction at the very top of the prompt (Gemini doesn't need separate field)
     full_prompt = (
         "You are a code generator. You MUST output ONLY raw [SCRIPT_START]...[SCRIPT_END] blocks. "
         "NO explanations, NO markdown, NO reasoning, NO extra text. "
@@ -144,18 +182,15 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
                 return resp
         except requests.Timeout:
             app.logger.warning(f"Timeout on attempt {attempt+1}/{max_retries}, extending timeout...")
-            # Increase timeout for next retry
-            timeout = (timeout[0], timeout[1] + 120)  # add 2 minutes each retry
-            time.sleep(2 ** attempt)  # exponential backoff
+            timeout = (timeout[0], timeout[1] + 120)
+            time.sleep(2 ** attempt)
         except Exception as e:
             app.logger.error(f"Request exception: {e}")
             break
     raise Exception(f"All retries failed for model {model}")
 
 def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=180.0):
-    """Calls Groq's OpenAI-compatible API for the review stage. Returns
-    the response text, or raises on failure (caller falls back to
-    unreviewed output)."""
+    """Calls Groq's OpenAI-compatible API for a single review request."""
     client = OpenAI(
         api_key=api_key,
         base_url=GROQ_BASE_URL,
@@ -173,7 +208,8 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=1
                 ],
                 stream=False,
                 extra_body={
-                    "reasoning_format": "hidden"
+                    "reasoning_format": "hidden",   # hides reasoning output
+                    "reasoning_effort": "none"      # disables thinking altogether
                 }
             )
             return response.choices[0].message.content
@@ -247,38 +283,76 @@ def generate():
         if output_text is None or not output_text.strip():
             return jsonify({"error": "Empty output from generation model"}), 500
 
-        # --- Review (Groq only) ---
-        review_result = None
+        # --- Review (Groq only) - CHUNKED ---
         final_output = output_text
         changed_scripts = []
+        review_raw = None
 
         if not groq_api_key:
-            app.logger.info("No Groq API key provided (review_key missing and no server fallback set); skipping review.")
+            app.logger.info("No Groq API key provided; skipping review.")
         else:
-            try:
-                FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
-                    client_scripts=clientscript,
-                    server_output=output_text,
-                    pre_existing_scripts=serverside or "None provided.",
-                )
+            # Truncate client_scripts if too large for a single review prompt
+            # We'll keep it under 20k characters (~5000 tokens) to leave room for other parts.
+            truncated_clientscript = truncate_text(clientscript, max_chars=20000)
 
-                app.logger.info(f"Sending review request to Groq ({GROQ_MODEL})...")
-                review_raw = call_groq_review(FormattedReviewPrompt, groq_api_key)
-                review_result = clean_model_output(review_raw)
-                final_output, changed_scripts = merge_reviewed_output(output_text, review_result)
+            # Split the generated server_output into chunks
+            output_chunks = chunk_text(output_text, max_tokens=6000)
+            app.logger.info(f"Split server_output into {len(output_chunks)} chunks for review.")
 
-            except Exception as e:
-                # Covers: rate limit, invalid key, timeout, etc.
-                # Never let a review failure lose the already-successful generation.
-                app.logger.error(f"Groq review stage failed, returning unreviewed output: {e}")
-                review_result = None
-                final_output = output_text
+            all_reviewed_blocks = {}
+            all_changed = []
+
+            for idx, chunk in enumerate(output_chunks):
+                try:
+                    # Build prompt for this chunk
+                    FormattedReviewPrompt = BASEREVIEWER_PROMPT.format(
+                        client_scripts=truncated_clientscript,
+                        server_output=chunk,
+                        pre_existing_scripts=serverside or "None provided.",
+                    )
+
+                    app.logger.info(f"Reviewing chunk {idx+1}/{len(output_chunks)}...")
+                    review_text = call_groq_review(FormattedReviewPrompt, groq_api_key)
+                    review_blocks = parse_script_blocks(review_text)
+
+                    if review_blocks:
+                        all_reviewed_blocks.update(review_blocks)
+                        all_changed.extend(review_blocks.keys())
+                    else:
+                        # If no blocks returned, keep the original chunk's blocks
+                        original_blocks = parse_script_blocks(chunk)
+                        all_reviewed_blocks.update(original_blocks)
+                        app.logger.warning(f"Chunk {idx+1} returned no review blocks, using original.")
+
+                    # Store raw review for debugging (optional)
+                    if idx == 0:
+                        review_raw = review_text
+                    else:
+                        review_raw = (review_raw or "") + "\n\n--- CHUNK " + str(idx+1) + " ---\n" + review_text
+
+                except Exception as e:
+                    app.logger.error(f"Review failed for chunk {idx+1}: {e}, using original chunk.")
+                    original_blocks = parse_script_blocks(chunk)
+                    all_reviewed_blocks.update(original_blocks)
+
+                # Small delay to avoid rate limiting
+                if idx < len(output_chunks) - 1:
+                    time.sleep(1.5)
+
+            # Merge reviewed blocks over original blocks
+            original_blocks = parse_script_blocks(output_text)
+            merged_blocks = dict(original_blocks)
+            merged_blocks.update(all_reviewed_blocks)  # reviewed overrides original
+
+            # Reconstruct final output
+            final_output = "\n\n".join(merged_blocks.values())
+            changed_scripts = list(all_changed)  # list of script names that were changed
 
         return jsonify({
             "response": final_output,
             "generation_raw": output_text,
-            "review_raw": review_result,
-            "review_model_used": GROQ_MODEL if review_result else None,
+            "review_raw": review_raw,
+            "review_model_used": GROQ_MODEL if groq_api_key else None,
             "scripts_changed_by_review": changed_scripts,
         })
 
