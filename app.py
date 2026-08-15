@@ -86,7 +86,7 @@ def merge_reviewed_output(base_text, review_text):
     review_blocks = parse_script_blocks(review_text)
 
     if not review_blocks:
-        app.logger.warning("Review output not in [SCRIPT_START] format; keeping base output only")
+        app.logger.warning(f"Review output not in [SCRIPT_START] format; keeping base output only, Output: {review_text}")
         return base_text, []
 
     if not base_blocks:
