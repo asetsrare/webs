@@ -182,10 +182,20 @@ Your output must be modular when the client demands it. A single "god script" th
 
 From the client script(s) alone, build your own table of every remote: path, kind (Event/Function), direction, arguments (name inferred from usage, type inferred from usage, order), return shape for Functions, and the trigger condition for every OnClientEvent listener. Do this exhaustively -- walk every function body, every conditional branch, every loop, every callback passed to task.spawn/coroutine.wrap/pcall. Do not skip a call because it is nested.
 
-For each remote, also note:
+**CRITICAL -- REMOTE LOCATION VARIETY**: Do not assume all remotes live under `ReplicatedStorage.Remotes`. The client may reference remotes via:
+- `player:FindFirstChild("SomeRemote")` (e.g., `ClaimDonation`)
+- `player:WaitForChild("SomeRemote")`
+- `game.ReplicatedStorage:FindFirstChild("SomeRemote")`
+- Direct `Instance.new("RemoteFunction")` parents assigned to players or other containers.
+
+You MUST find every single remote call site, regardless of how the remote is obtained. For each remote, record:
+- The **exact path or parent** the client uses to resolve it.
 - Does the client unpack a single return value, a tuple, or index into a table?
 - Does the same remote get called from more than one place with different argument counts (if so, the union is the real contract)?
 - Which domain (Donation, Shop, Auction, Gifting, Admin, Data/Settings, Voice, etc.) does this remote belong to?
+
+**For Functions**: Note the exact number of return values the client unpacks and what it does with them (e.g., `local a, b = remote:InvokeServer(...)` vs `local result = remote:InvokeServer(...)` vs `local t = remote:InvokeServer(...); print(t.field)`).
+**For Events**: Note the exact argument order and types the client passes in `:FireServer(...)`.
 
 Only after this table is built should you open the generated server script(s) and start comparing.
 
@@ -195,13 +205,28 @@ Only after this table is built should you open the generated server script(s) an
 
 For every generated script, compare its content against your independently-derived contract and identify every divergence in these categories:
 
-1. MISSING REMOTES -- a remote the client calls that has no handler at all in the generated output.
-2. UNFIRED EVENTS -- an OnClientEvent listener the client is shown to depend on, where no FireClient/FireAllClients call in the generated output actually triggers it, or triggers it with the wrong arguments.
-3. STUBS -- a handler that exists and is connected, but whose body is empty, is only a comment, returns early with no state change, or otherwise does not perform the action the client expects. A handler that "exists" is not the same as a handler that "works."
-4. FIDELITY MISMATCHES -- argument order, argument types, or RemoteFunction return shape that does not match how the client actually sends or consumes them.
-5. RESOURCE FLOW BREAKS -- this is the category most likely to be silently wrong. For every currency, inventory item, or claimable reward in the script, trace ALL the places that write to it and ALL the places that read from it to pay it out (balance displays, claim remotes, withdraw remotes). A resource is only correctly implemented if every branch that should deliver it to a player (online recipient, offline recipient, gifted, purchased, claimed) writes to the SAME field that the payout/claim path actually reads. A common bug is crediting a "raised" or "received" tracking field on one branch while the real claim remote only ever drains a differently-named field -- meaning the resource is tracked but never actually payable. Trace every currency/item field by name across the entire script before concluding it is correct.
-6. SECURITY GAPS -- missing validation, a single cooldown shared across unrelated action types (which lets a high-frequency remote starve a low-frequency one), trusting a client-supplied Instance reference directly, or missing permission checks.
-7. DATA CONSISTENCY -- DataStore calls not pcall-wrapped with retry, a claim/consume flow that wipes more state than the specific entries being claimed, or any path that could leave a player's cached data nil.
+1. **MISSING REMOTES** -- a remote the client calls that has no handler at all in the generated output. This includes remotes the server may have accidentally left out, regardless of where the client obtains them (Player, ReplicatedStorage, etc.).
+
+2. **UNFIRED EVENTS** -- an OnClientEvent listener the client is shown to depend on, where no FireClient/FireAllClients call in the generated output actually triggers it, or triggers it with the wrong arguments.
+
+3. **STUBS** -- a handler that exists and is connected, but whose body is empty, is only a comment, returns early with no state change, or otherwise does not perform the action the client expects. A handler that "exists" is not the same as a handler that "works."
+
+4. **FIDELITY MISMATCHES** -- argument order, argument types, or RemoteFunction return shape that does not match how the client actually sends or consumes them.
+   **CRITICAL RULE**: You MUST NOT change the Kind (Event vs Function) of a remote. The client determines this definitively:
+   - If the client uses `:FireServer()` → it is an **Event**.
+   - If the client uses `:InvokeServer()` → it is a **Function**.
+   If the generated script declares an Event where the client uses a Function (or vice versa), that is a critical FIDELITY MISMATCH that must be corrected immediately.
+
+5. **RESOURCE FLOW BREAKS** -- this is the category most likely to be silently wrong. For every currency, inventory item, or claimable reward in the script, trace ALL the places that write to it and ALL the places that read from it to pay it out (balance displays, claim remotes, withdraw remotes). A resource is only correctly implemented if every branch that should deliver it to a player (online recipient, offline recipient, gifted, purchased, claimed) writes to the SAME field that the payout/claim path actually reads. A common bug is crediting a "raised" or "received" tracking field on one branch while the real claim remote only ever drains a differently-named field -- meaning the resource is tracked but never actually payable. Trace every currency/item field by name across the entire script before concluding it is correct.
+   **SPECIFIC CHECK -- SHOP/CURRENCY PURCHASES**: If the client script contains UI or logic that spends a currency (e.g., Giftbux, Tickets) to purchase an item (e.g., booth, gamepass, asset), the server MUST have a remote handler that:
+   - Deducts the exact cost from the player's currency balance.
+   - Grants the purchased item to the player's inventory (e.g., `PurchasedBooths`, `UserAssets`).
+   - Fires any relevant client events (e.g., `NewPurchasedBooths`, `PurchasePopup`).
+   If no such handler exists, flag it as **MISSING REMOTE** AND **RESOURCE FLOW**.
+
+6. **SECURITY GAPS** -- missing validation, a single cooldown shared across unrelated action types (which lets a high-frequency remote starve a low-frequency one), trusting a client-supplied Instance reference directly, or missing permission checks.
+
+7. **DATA CONSISTENCY** -- DataStore calls not pcall-wrapped with retry, a claim/consume flow that wipes more state than the specific entries being claimed, or any path that could leave a player's cached data nil.
 
 Do NOT flag something as a bug just because it looks incomplete if the client script genuinely gives no evidence that remote/event/flow should exist -- inventing new scope is itself a mistake. Only flag real divergences from what the client script demonstrates.
 
@@ -226,6 +251,8 @@ For each script you are changing or creating:
   - All required RemoteEvent/Function definitions and connections for that domain.
   - All state mutations (DataService reads/writes) relevant to that domain.
   - All event firings (`:FireClient`) that the client listens for in that domain.
+- **CRITICAL**: When adding a missing remote, you MUST use the exact kind (Event or Function) that the client uses. Do not change an Event to a Function or vice versa.
+- If a missing remote is parented differently (e.g., inside the Player object rather than ReplicatedStorage), you must create it in the correct location and parent it appropriately.
 - Do not restyle, rename variables, reorganize sections, or "improve" code that already matches the contract. Minimal, targeted changes only.
 - If a pre-existing/reference server script was provided, reuse its naming conventions, remotes folder structure, and DataService interface rather than introducing a new pattern.
 - If a fix requires assuming something the client script does not make explicit (e.g., a cooldown duration, a page size), pick the most conservative reasonable value and leave a short comment noting it was not directly derivable.
