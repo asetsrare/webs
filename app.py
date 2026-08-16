@@ -21,10 +21,10 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "qwen/qwen3.6-27b"
-MAX_TOKENS_PER_REQUEST = 2500
-CHUNK_DELAY = 30
 
-CLIENT_MAX_CHARS = 8000
+# Cap the server_output length to keep the total request under ~8000 tokens
+MAX_OUTPUT_CHARS = 25000   # ~6250 tokens, leaving room for overhead
+CLIENT_MAX_CHARS = 8000    # truncate client scripts if needed
 PREEXISTING_MAX_CHARS = 3000
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -125,7 +125,8 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
             break
     raise Exception(f"All retries failed for model {model}")
 
-def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=180.0):
+def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=60.0):
+    """Single review call with 60s timeout."""
     client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=timeout)
     last_error = None
     for attempt in range(max_retries):
@@ -147,38 +148,6 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=1
                 time.sleep(2 ** attempt)
     raise last_error
 
-def split_into_chunks(server_output, client_scripts, pre_existing, max_tokens=MAX_TOKENS_PER_REQUEST):
-    TEMPLATE_OVERHEAD = 500
-    overhead_chars = len(client_scripts) + len(pre_existing) + TEMPLATE_OVERHEAD
-    max_chars_per_chunk = int((max_tokens * 3.5) - overhead_chars)
-
-    if max_chars_per_chunk <= 0:
-        raise ValueError(f"Overhead ({overhead_chars} chars) exceeds token limit; need to truncate further.")
-
-    if len(server_output) <= max_chars_per_chunk:
-        return [server_output]
-
-    chunks = []
-    lines = server_output.splitlines(keepends=True)
-    current = ""
-    for line in lines:
-        if len(current) + len(line) > max_chars_per_chunk and current:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-    if current:
-        chunks.append(current)
-
-    final = []
-    for ch in chunks:
-        if len(ch) > max_chars_per_chunk:
-            for i in range(0, len(ch), max_chars_per_chunk):
-                final.append(ch[i:i+max_chars_per_chunk])
-        else:
-            final.append(ch)
-    return final
-
 # =========================================================================
 # ROUTES
 # =========================================================================
@@ -189,7 +158,6 @@ def health():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    # Base response structure
     response_data = {
         "success": False,
         "response": None,
@@ -205,7 +173,7 @@ def generate():
         data = request.get_json()
         if not data:
             response_data["error"] = "Missing JSON body"
-            return jsonify(response_data), 400  # Still 400 for malformed request
+            return jsonify(response_data), 400
 
         clientscript = data.get("client_scripts")
         additional = data.get("additional_info")
@@ -214,7 +182,6 @@ def generate():
         gemini_model = data.get("ai_model")
         groq_api_key = data.get("review_key")
 
-        # Validate required fields
         if not clientscript:
             response_data["error"] = "Missing 'client_scripts'"
             return jsonify(response_data), 400
@@ -237,7 +204,6 @@ def generate():
             gen_resp = call_gemini(gemini_model, FormattedPrompt, gemini_api_key)
         except Exception as e:
             response_data["error"] = f"Generation failed: {str(e)}"
-            # Still return 200 so client doesn't see a 500, but success is false
             return jsonify(response_data), 200
 
         if gen_resp.status_code != 200:
@@ -256,67 +222,44 @@ def generate():
             response_data["error"] = "Empty output from generation"
             return jsonify(response_data), 200
 
-        # Generation succeeded
         response_data["success"] = True
         response_data["generation_raw"] = output_text
-        response_data["response"] = output_text  # start with generation as final
+        response_data["response"] = output_text
 
-        # --- Review (Groq) with chunking and rate-limit delay ---
+        # --- Review (Groq) - SINGLE CALL with truncation ---
         if groq_api_key:
+            # Truncate everything to stay under token limit
             truncated_clientscript = truncate_text(clientscript, max_chars=CLIENT_MAX_CHARS)
             truncated_serverside = truncate_text(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
+            # Truncate the server_output to a safe length so the whole request fits in one go
+            truncated_output = truncate_text(output_text, max_chars=MAX_OUTPUT_CHARS)
 
             try:
-                chunks = split_into_chunks(
-                    server_output=output_text,
+                prompt = BASEREVIEWER_PROMPT.format(
                     client_scripts=truncated_clientscript,
-                    pre_existing=truncated_serverside,
-                    max_tokens=MAX_TOKENS_PER_REQUEST
+                    server_output=truncated_output,
+                    pre_existing_scripts=truncated_serverside or "None provided.",
                 )
-            except ValueError as e:
-                response_data["warning"] = f"Review skipped: {str(e)}"
-                # Keep response as generation only
-                return jsonify(response_data), 200
+                app.logger.info("Sending single review request to Groq (truncated output)")
+                review = call_groq_review(prompt, groq_api_key)
+                review_blocks = parse_script_blocks(review)
 
-            app.logger.info(f"Reviewing {len(chunks)} chunks (delay {CHUNK_DELAY}s between)")
+                if review_blocks:
+                    # Merge reviewed blocks with original
+                    original_blocks = parse_script_blocks(output_text)
+                    merged = dict(original_blocks)
+                    merged.update(review_blocks)
+                    final_output = "\n\n".join(merged.values())
+                    response_data["response"] = final_output
+                    response_data["review_raw"] = review
+                    response_data["review_model_used"] = GROQ_MODEL
+                    response_data["scripts_changed_by_review"] = list(review_blocks.keys())
+                else:
+                    response_data["warning"] = "Groq returned no review blocks; keeping generation output."
+            except Exception as e:
+                app.logger.error(f"Groq review failed: {e}")
+                response_data["warning"] = f"Review failed: {str(e)}. Keeping generation output."
 
-            all_reviewed_blocks = {}
-            all_changed = []
-            review_parts = []
-
-            for idx, chunk in enumerate(chunks):
-                try:
-                    prompt = BASEREVIEWER_PROMPT.format(
-                        client_scripts=truncated_clientscript,
-                        server_output=chunk,
-                        pre_existing_scripts=truncated_serverside or "None provided.",
-                    )
-                    review = call_groq_review(prompt, groq_api_key)
-                    blocks = parse_script_blocks(review)
-                    if blocks:
-                        all_reviewed_blocks.update(blocks)
-                        all_changed.extend(blocks.keys())
-                    review_parts.append(f"--- CHUNK {idx+1}/{len(chunks)} ---\n{review}")
-                except Exception as e:
-                    app.logger.error(f"Chunk {idx+1} failed: {e}, keeping original")
-                    orig_blocks = parse_script_blocks(chunk)
-                    all_reviewed_blocks.update(orig_blocks)
-
-                if idx < len(chunks) - 1:
-                    app.logger.info(f"Waiting {CHUNK_DELAY}s before next chunk...")
-                    time.sleep(CHUNK_DELAY)
-
-            # Merge reviewed blocks with original
-            original_blocks = parse_script_blocks(output_text)
-            merged = dict(original_blocks)
-            merged.update(all_reviewed_blocks)
-            final_output = "\n\n".join(merged.values())
-            response_data["response"] = final_output
-            response_data["review_raw"] = "\n\n".join(review_parts)
-            response_data["review_model_used"] = GROQ_MODEL
-            response_data["scripts_changed_by_review"] = all_changed
-
-        # If no review, we already have response set to generation
         return jsonify(response_data), 200
 
     except Exception as e:
