@@ -21,8 +21,12 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "qwen/qwen3.6-27b"
-MAX_TOKENS_PER_REQUEST = 3000     # keep each chunk small to avoid 413
-CHUNK_DELAY = 30                  # seconds between chunk requests (TPM safety)
+MAX_TOKENS_PER_REQUEST = 2500     # keep chunks very small
+CHUNK_DELAY = 30                  # seconds between chunk requests
+
+# Truncation limits – reduce aggressively to fit overhead
+CLIENT_MAX_CHARS = 8000
+PREEXISTING_MAX_CHARS = 3000
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are a senior Roblox Luau code reviewer. Output ONLY raw "
@@ -40,7 +44,7 @@ SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
 # HELPERS
 # =========================================================================
 
-def truncate_text(text, max_chars=10000):
+def truncate_text(text, max_chars):
     if not text:
         return text
     if len(text) > max_chars:
@@ -145,13 +149,16 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=1
     raise last_error
 
 def split_into_chunks(server_output, client_scripts, pre_existing, max_tokens=MAX_TOKENS_PER_REQUEST):
-    """Split server_output into chunks that fit within max_tokens (including overhead)."""
+    """
+    Split server_output into chunks that fit within max_tokens.
+    Raises ValueError if overhead alone exceeds the limit.
+    """
     TEMPLATE_OVERHEAD = 500
     overhead_chars = len(client_scripts) + len(pre_existing) + TEMPLATE_OVERHEAD
     max_chars_per_chunk = int((max_tokens * 3.5) - overhead_chars)
 
     if max_chars_per_chunk <= 0:
-        raise ValueError("Overhead too large for token limit.")
+        raise ValueError(f"Overhead ({overhead_chars} chars) exceeds token limit; need to truncate further.")
 
     if len(server_output) <= max_chars_per_chunk:
         return [server_output]
@@ -242,8 +249,9 @@ def generate():
         review_raw = None
 
         if groq_api_key:
-            truncated_clientscript = truncate_text(clientscript, max_chars=10000)
-            truncated_serverside = truncate_text(serverside or "", max_chars=5000)
+            # Truncate aggressively to reduce overhead
+            truncated_clientscript = truncate_text(clientscript, max_chars=CLIENT_MAX_CHARS)
+            truncated_serverside = truncate_text(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
 
             try:
                 chunks = split_into_chunks(
@@ -253,11 +261,15 @@ def generate():
                     max_tokens=MAX_TOKENS_PER_REQUEST
                 )
             except ValueError as e:
-                app.logger.error(f"Chunking failed: {e}")
+                # Overhead still too large – skip review and return a warning
+                app.logger.warning(f"Chunking failed: {e}. Skipping review.")
                 return jsonify({
                     "response": output_text,
                     "generation_raw": output_text,
-                    "warning": "Review skipped – input too large even after truncation."
+                    "review_raw": None,
+                    "review_model_used": None,
+                    "scripts_changed_by_review": [],
+                    "warning": f"Review skipped – input overhead too large: {str(e)}"
                 })
 
             app.logger.info(f"Reviewing {len(chunks)} chunks (delay {CHUNK_DELAY}s between)")
@@ -284,12 +296,11 @@ def generate():
                     orig_blocks = parse_script_blocks(chunk)
                     all_reviewed_blocks.update(orig_blocks)
 
-                # **CRITICAL**: Wait between chunks to stay under TPM limit (8000 tokens/min)
                 if idx < len(chunks) - 1:
                     app.logger.info(f"Waiting {CHUNK_DELAY}s before next chunk...")
                     time.sleep(CHUNK_DELAY)
 
-            # Merge
+            # Merge reviewed blocks with original
             original_blocks = parse_script_blocks(output_text)
             merged = dict(original_blocks)
             merged.update(all_reviewed_blocks)
