@@ -19,13 +19,14 @@ from prompts import Base_prompt, BASEREVIEWER_PROMPT
 # CONFIG
 # =========================================================================
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL = "qwen/qwen3.6-27b"
+# Mistral API (free tier)
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
+MISTRAL_MODEL = "mistral-small-latest"   # You can also use "mistral-medium" or "codestral-latest"
 
-# Cap the server_output length to keep the total request under ~8000 tokens
-MAX_OUTPUT_CHARS = 25000   # ~6250 tokens, leaving room for overhead
-CLIENT_MAX_CHARS = 8000    # truncate client scripts if needed
-PREEXISTING_MAX_CHARS = 3000
+# Keep these higher since Mistral has bigger limits
+MAX_OUTPUT_CHARS = 40000   # ~10k tokens, safe
+CLIENT_MAX_CHARS = 20000
+PREEXISTING_MAX_CHARS = 10000
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are a senior Roblox Luau code reviewer. Output ONLY raw "
@@ -125,9 +126,17 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
             break
     raise Exception(f"All retries failed for model {model}")
 
-def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=60.0):
-    """Single review call with 60s timeout."""
-    client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=timeout)
+# ============================================================
+# NEW: Mistral review (instead of Groq)
+# ============================================================
+def call_mistral_review(prompt, api_key, model=MISTRAL_MODEL, max_retries=2, timeout=120.0):
+    """Calls Mistral's OpenAI-compatible API for review."""
+    client = OpenAI(
+        api_key=api_key,
+        base_url=MISTRAL_BASE_URL,
+        timeout=timeout,
+    )
+
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -138,11 +147,13 @@ def call_groq_review(prompt, api_key, model=GROQ_MODEL, max_retries=2, timeout=6
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
-                extra_body={"reasoning_format": "hidden", "reasoning_effort": "none"}
+                # Mistral doesn't need reasoning_format – just use normal
+                temperature=0.0,
+                max_tokens=8192,   # review output shouldn't be huge
             )
             return response.choices[0].message.content
         except Exception as e:
-            app.logger.warning(f"Groq review attempt {attempt+1}/{max_retries} failed: {e}")
+            app.logger.warning(f"Mistral review attempt {attempt+1}/{max_retries} failed: {e}")
             last_error = e
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
@@ -161,12 +172,10 @@ def generate():
     response_data = {
         "success": False,
         "response": None,
-        "generation_raw": None,
-        "review_raw": None,
-        "review_model_used": None,
-        "scripts_changed_by_review": [],
         "error": None,
-        "warning": None
+        "warning": None,
+        "review_model_used": None,
+        "scripts_changed_by_review": []
     }
 
     try:
@@ -180,7 +189,7 @@ def generate():
         serverside = data.get("server_scripts")
         gemini_api_key = data.get("api_key")
         gemini_model = data.get("ai_model")
-        groq_api_key = data.get("review_key")
+        mistral_api_key = data.get("review_key")   # Now this is the Mistral key
 
         if not clientscript:
             response_data["error"] = "Missing 'client_scripts'"
@@ -198,7 +207,7 @@ def generate():
             third=serverside or "None provided.",
         )
 
-        # --- Generation ---
+        # --- Generation (Gemini) ---
         app.logger.info(f"Generating with Gemini: {gemini_model}")
         try:
             gen_resp = call_gemini(gemini_model, FormattedPrompt, gemini_api_key)
@@ -223,15 +232,14 @@ def generate():
             return jsonify(response_data), 200
 
         response_data["success"] = True
-        response_data["generation_raw"] = output_text
         response_data["response"] = output_text
 
-        # --- Review (Groq) - SINGLE CALL with truncation ---
-        if groq_api_key:
-            # Truncate everything to stay under token limit
+        # --- Review (Mistral) - SINGLE CALL with larger limits ---
+        if mistral_api_key:
+            # Truncate but less aggressively (Mistral can handle more)
             truncated_clientscript = truncate_text(clientscript, max_chars=CLIENT_MAX_CHARS)
             truncated_serverside = truncate_text(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
-            # Truncate the server_output to a safe length so the whole request fits in one go
+            # No need to truncate output as much; Mistral has 32k context
             truncated_output = truncate_text(output_text, max_chars=MAX_OUTPUT_CHARS)
 
             try:
@@ -240,24 +248,22 @@ def generate():
                     server_output=truncated_output,
                     pre_existing_scripts=truncated_serverside or "None provided.",
                 )
-                app.logger.info("Sending single review request to Groq (truncated output)")
-                review = call_groq_review(prompt, groq_api_key)
+                app.logger.info("Sending review request to Mistral")
+                review = call_mistral_review(prompt, mistral_api_key)
                 review_blocks = parse_script_blocks(review)
 
                 if review_blocks:
-                    # Merge reviewed blocks with original
                     original_blocks = parse_script_blocks(output_text)
                     merged = dict(original_blocks)
                     merged.update(review_blocks)
                     final_output = "\n\n".join(merged.values())
                     response_data["response"] = final_output
-                    response_data["review_raw"] = review
-                    response_data["review_model_used"] = GROQ_MODEL
+                    response_data["review_model_used"] = MISTRAL_MODEL
                     response_data["scripts_changed_by_review"] = list(review_blocks.keys())
                 else:
-                    response_data["warning"] = "Groq returned no review blocks; keeping generation output."
+                    response_data["warning"] = "Mistral returned no review blocks; keeping generation output."
             except Exception as e:
-                app.logger.error(f"Groq review failed: {e}")
+                app.logger.error(f"Mistral review failed: {e}")
                 response_data["warning"] = f"Review failed: {str(e)}. Keeping generation output."
 
         return jsonify(response_data), 200
