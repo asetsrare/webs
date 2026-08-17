@@ -39,6 +39,72 @@ logging.basicConfig(level=logging.INFO)
 
 SCRIPT_BLOCK_RE = re.compile(r"\[SCRIPT_START\](.*?)\[SCRIPT_END\]", re.DOTALL)
 SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
+COMPLETED_RE = re.compile(r"\[COMPLETED-START\](.*?)\[COMPLETED-END\]", re.DOTALL)
+
+# =========================================================================
+# COMPLETED SYSTEMS STORE
+# =========================================================================
+
+COMPLETED_STORE_FILE = "completed_systems.json"
+
+def load_completed_systems():
+    """Load the completed systems store from JSON file."""
+    try:
+        with open(COMPLETED_STORE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_completed_system(script_name, data):
+    """Save a single completed system to the store."""
+    completed = load_completed_systems()
+    completed[script_name] = data
+    with open(COMPLETED_STORE_FILE, "w") as f:
+        json.dump(completed, f, indent=2)
+
+def format_completed_systems_for_prompt(completed_dict):
+    """Convert completed systems dict to a formatted string for the prompt."""
+    if not completed_dict:
+        return "None provided."
+    parts = []
+    for name, data in completed_dict.items():
+        parts.append(f"[COMPLETED-START]")
+        parts.append(f"scriptName = {data.get('scriptName', name)}")
+        parts.append(f"scriptPath = {data.get('scriptPath', '')}")
+        remotes = ", ".join(data.get('remotes', []))
+        parts.append(f"remotes = {remotes}")
+        events = ", ".join(data.get('eventsFired', []))
+        parts.append(f"eventsFired = {events}")
+        parts.append(f"scfsScore = {data.get('scfsScore', '')}")
+        parts.append(f"scriptContent =")
+        parts.append(data.get('scriptContent', ''))
+        parts.append("[COMPLETED-END]")
+        parts.append("")  # blank line
+    return "\n".join(parts)
+
+def parse_completed_blocks(text):
+    """Extract completed systems from review output."""
+    blocks = []
+    for match in COMPLETED_RE.finditer(text):
+        body = match.group(1)
+        name_match = re.search(r"scriptName\s*=\s*(.+)", body)
+        path_match = re.search(r"scriptPath\s*=\s*(.+)", body)
+        remotes_match = re.search(r"remotes\s*=\s*(.+)", body)
+        events_match = re.search(r"eventsFired\s*=\s*(.+)", body)
+        score_match = re.search(r"scfsScore\s*=\s*(.+)", body)
+        content_match = re.search(r"scriptContent\s*=\s*\n(.*)", body, re.DOTALL)
+
+        if name_match:
+            block_data = {
+                "scriptName": name_match.group(1).strip(),
+                "scriptPath": path_match.group(1).strip() if path_match else "",
+                "remotes": [r.strip() for r in remotes_match.group(1).split(",")] if remotes_match else [],
+                "eventsFired": [e.strip() for e in events_match.group(1).split(",")] if events_match else [],
+                "scfsScore": score_match.group(1).strip() if score_match else "",
+                "scriptContent": content_match.group(1).strip() if content_match else ""
+            }
+            blocks.append(block_data)
+    return blocks
 
 # =========================================================================
 # HELPERS
@@ -63,8 +129,9 @@ def clean_model_output(text):
     start_idx = text.find("[SCRIPT_START]")
     no_changes_idx = text.find("No Changes Required")
     no_server_idx = text.find("No Server Script")
+    completed_idx = text.find("[COMPLETED-START]")
 
-    candidates = [i for i in (start_idx, no_changes_idx, no_server_idx) if i > 0]
+    candidates = [i for i in (start_idx, no_changes_idx, no_server_idx, completed_idx) if i >= 0]
     if candidates:
         text = text[min(candidates):]
     return text.strip()
@@ -126,11 +193,7 @@ def call_gemini(model, prompt, api_key, max_retries=3, timeout=(10, 1200)):
             break
     raise Exception(f"All retries failed for model {model}")
 
-# ============================================================
-# NEW: Mistral review (instead of Groq)
-# ============================================================
 def call_mistral_review(prompt, api_key, model=MISTRAL_MODEL, max_retries=2, timeout=120.0):
-    """Calls Mistral's OpenAI-compatible API for review."""
     client = OpenAI(
         api_key=api_key,
         base_url=MISTRAL_BASE_URL,
@@ -147,9 +210,8 @@ def call_mistral_review(prompt, api_key, model=MISTRAL_MODEL, max_retries=2, tim
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
-                # Mistral doesn't need reasoning_format – just use normal
                 temperature=0.0,
-                max_tokens=8192,   # review output shouldn't be huge
+                max_tokens=8192,
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -175,7 +237,8 @@ def generate():
         "error": None,
         "warning": None,
         "review_model_used": None,
-        "scripts_changed_by_review": []
+        "scripts_changed_by_review": [],
+        "completed_systems_updated": []   # list of script names that were saved as completed
     }
 
     try:
@@ -189,7 +252,7 @@ def generate():
         serverside = data.get("server_scripts")
         gemini_api_key = data.get("api_key")
         gemini_model = data.get("ai_model")
-        mistral_api_key = data.get("review_key")   # Now this is the Mistral key
+        mistral_api_key = data.get("review_key")   # Mistral key
 
         if not clientscript:
             response_data["error"] = "Missing 'client_scripts'"
@@ -201,13 +264,17 @@ def generate():
             response_data["error"] = "Missing 'ai_model'"
             return jsonify(response_data), 400
 
+        # --- Load completed systems ---
+        completed_store = load_completed_systems()
+        completed_text = format_completed_systems_for_prompt(completed_store)
+
+        # --- Generation (Gemini) ---
         FormattedPrompt = Base_prompt.format(
             first=clientscript,
             second=additional or "None provided.",
             third=serverside or "None provided.",
         )
 
-        # --- Generation (Gemini) ---
         app.logger.info(f"Generating with Gemini: {gemini_model}")
         try:
             gen_resp = call_gemini(gemini_model, FormattedPrompt, gemini_api_key)
@@ -234,24 +301,37 @@ def generate():
         response_data["success"] = True
         response_data["response"] = output_text
 
-        # --- Review (Mistral) - SINGLE CALL with larger limits ---
+        # --- Review (Mistral) - SINGLE CALL with completed systems ---
         if mistral_api_key:
-            # Truncate but less aggressively (Mistral can handle more)
+            # Truncate inputs but keep completed systems intact
             truncated_clientscript = truncate_text(clientscript, max_chars=CLIENT_MAX_CHARS)
             truncated_serverside = truncate_text(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
-            # No need to truncate output as much; Mistral has 32k context
             truncated_output = truncate_text(output_text, max_chars=MAX_OUTPUT_CHARS)
 
             try:
                 prompt = BASEREVIEWER_PROMPT.format(
                     client_scripts=truncated_clientscript,
                     server_output=truncated_output,
-                    pre_existing_scripts=truncated_serverside or "None provided.",
+                    completed_systems=completed_text   # include full completed systems
                 )
-                app.logger.info("Sending review request to Mistral")
+                app.logger.info("Sending review request to Mistral with completed systems")
                 review = call_mistral_review(prompt, mistral_api_key)
-                review_blocks = parse_script_blocks(review)
 
+                # --- Parse COMPLETED blocks from review ---
+                completed_blocks = parse_completed_blocks(review)
+                updated_completed_names = []
+                for block in completed_blocks:
+                    name = block.get("scriptName")
+                    if name:
+                        save_completed_system(name, block)
+                        updated_completed_names.append(name)
+
+                if updated_completed_names:
+                    response_data["completed_systems_updated"] = updated_completed_names
+                    # Reload completed store to get fresh data for merging? Not needed for response.
+
+                # --- Parse SCRIPT blocks for fixes ---
+                review_blocks = parse_script_blocks(review)
                 if review_blocks:
                     original_blocks = parse_script_blocks(output_text)
                     merged = dict(original_blocks)
@@ -262,6 +342,7 @@ def generate():
                     response_data["scripts_changed_by_review"] = list(review_blocks.keys())
                 else:
                     response_data["warning"] = "Mistral returned no review blocks; keeping generation output."
+
             except Exception as e:
                 app.logger.error(f"Mistral review failed: {e}")
                 response_data["warning"] = f"Review failed: {str(e)}. Keeping generation output."
