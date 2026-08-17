@@ -1,10 +1,10 @@
-import threading
 import os
 import re
 import requests
 import json
 import logging
 import time
+import threading
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
@@ -38,9 +38,13 @@ REVIEWER_SYSTEM_PROMPT = (
 
 logging.basicConfig(level=logging.INFO)
 
+# Regular expressions for parsing
 SCRIPT_BLOCK_RE = re.compile(r"\[SCRIPT_START\](.*?)\[SCRIPT_END\]", re.DOTALL)
 SCRIPT_NAME_RE = re.compile(r"scriptName\s*=\s*(.+)")
 COMPLETED_RE = re.compile(r"\[COMPLETED-START\](.*?)\[COMPLETED-END\]", re.DOTALL)
+
+# File lock for completed systems store (thread-safe)
+completed_lock = threading.Lock()
 
 # =========================================================================
 # COMPLETED SYSTEMS STORE
@@ -57,11 +61,12 @@ def load_completed_systems():
         return {}
 
 def save_completed_system(script_name, data):
-    """Save a single completed system to the store."""
-    completed = load_completed_systems()
-    completed[script_name] = data
-    with open(COMPLETED_STORE_FILE, "w") as f:
-        json.dump(completed, f, indent=2)
+    """Save a single completed system to the store with thread safety."""
+    with completed_lock:
+        completed = load_completed_systems()
+        completed[script_name] = data
+        with open(COMPLETED_STORE_FILE, "w") as f:
+            json.dump(completed, f, indent=2)
 
 def format_completed_systems_for_prompt(completed_dict):
     """Convert completed systems dict to a formatted string for the prompt."""
@@ -77,6 +82,7 @@ def format_completed_systems_for_prompt(completed_dict):
         events = ", ".join(data.get('eventsFired', []))
         parts.append(f"eventsFired = {events}")
         parts.append(f"scfsScore = {data.get('scfsScore', '')}")
+        parts.append(f"created_at = {data.get('created_at', '')}")
         parts.append(f"scriptContent =")
         parts.append(data.get('scriptContent', ''))
         parts.append("[COMPLETED-END]")
@@ -102,7 +108,8 @@ def parse_completed_blocks(text):
                 "remotes": [r.strip() for r in remotes_match.group(1).split(",")] if remotes_match else [],
                 "eventsFired": [e.strip() for e in events_match.group(1).split(",")] if events_match else [],
                 "scfsScore": score_match.group(1).strip() if score_match else "",
-                "scriptContent": content_match.group(1).strip() if content_match else ""
+                "scriptContent": content_match.group(1).strip() if content_match else "",
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
             blocks.append(block_data)
     return blocks
@@ -111,12 +118,17 @@ def parse_completed_blocks(text):
 # HELPERS
 # =========================================================================
 
-def truncate_text(text, max_chars):
+def truncate_text_smart(text, max_chars):
+    """Truncate text at the nearest newline before max_chars to avoid cutting code."""
     if not text:
         return text
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n\n... [TRUNCATED]"
-    return text
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    last_newline = truncated.rfind('\n')
+    if last_newline > max_chars * 0.8:  # Only cut at newline if it's not too far back
+        return text[:last_newline] + "\n\n... [TRUNCATED]"
+    return truncated + "\n\n... [TRUNCATED]"
 
 def clean_model_output(text):
     if not text:
@@ -230,6 +242,20 @@ def call_mistral_review(prompt, api_key, model=MISTRAL_MODEL, max_retries=2, tim
 def health():
     return jsonify({"status": "ok"})
 
+@app.route("/completed", methods=["GET"])
+def list_completed():
+    """Return the list of completed systems for debugging."""
+    completed = load_completed_systems()
+    return jsonify({"success": True, "completed_systems": completed})
+
+@app.route("/reset-completed", methods=["POST"])
+def reset_completed():
+    """Reset the completed systems store (for testing)."""
+    with completed_lock:
+        with open(COMPLETED_STORE_FILE, "w") as f:
+            json.dump({}, f, indent=2)
+    return jsonify({"success": True, "message": "Completed systems store reset."})
+
 @app.route("/generate", methods=["POST"])
 def generate():
     response_data = {
@@ -253,7 +279,8 @@ def generate():
         serverside = data.get("server_scripts")
         gemini_api_key = data.get("api_key")
         gemini_model = data.get("ai_model")
-        mistral_api_key = data.get("review_key")   # Mistral key
+        # Use provided key, or fall back to environment variable
+        mistral_api_key = data.get("review_key") or os.getenv("MISTRAL_API_KEY")
 
         if not clientscript:
             response_data["error"] = "Missing 'client_scripts'"
@@ -304,10 +331,10 @@ def generate():
 
         # --- Review (Mistral) - SINGLE CALL with completed systems ---
         if mistral_api_key:
-            # Truncate inputs but keep completed systems intact
-            truncated_clientscript = truncate_text(clientscript, max_chars=CLIENT_MAX_CHARS)
-            truncated_serverside = truncate_text(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
-            truncated_output = truncate_text(output_text, max_chars=MAX_OUTPUT_CHARS)
+            # Truncate inputs with smart truncation
+            truncated_clientscript = truncate_text_smart(clientscript, max_chars=CLIENT_MAX_CHARS)
+            truncated_serverside = truncate_text_smart(serverside or "", max_chars=PREEXISTING_MAX_CHARS)
+            truncated_output = truncate_text_smart(output_text, max_chars=MAX_OUTPUT_CHARS)
 
             try:
                 prompt = BASEREVIEWER_PROMPT.format(
@@ -329,7 +356,6 @@ def generate():
 
                 if updated_completed_names:
                     response_data["completed_systems_updated"] = updated_completed_names
-                    # Reload completed store to get fresh data for merging? Not needed for response.
 
                 # --- Parse SCRIPT blocks for fixes ---
                 review_blocks = parse_script_blocks(review)
